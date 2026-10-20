@@ -13,46 +13,93 @@ python Audio_BPR/subject_adapter_experiment.py \
   --audio_path /path/to/alice_ict_pairs.npy \
   --visual_path /path/to/nieuwland_ict_pairs.npy \
   --output_dir results/combined_seen_subjects \
-  --seeds 1 2 3 \
+  --seed 1 \
   --split_seed 42 \
   --ranks 4 8 16 32 \
-  --alpha_ratios 0.25 1 2 3
+  --alpha_ratios 0.25 1 2 3 \
+  --placements input_only eeg_backbone full_eeg
 ```
 
 Defaults: jointly train on both datasets, transformer EEG encoder, CLS pooling, frozen BERT-base-uncased text encoder and identity text projection, AdamW (`lr=1e-5`, weight decay `0.01`), InfoNCE temperature `0.07`, batch size 32, 200 maximum epochs, 10 warmup epochs followed by linear decay, patience 10. No text-encoder LoRA is enabled. Pretrained model/tokenizer files must be available locally or downloadable from Hugging Face; local JSON logs do not require a W&B account.
 
 Every subject is split independently into training, validation, and test pairs (approximately 80/10/10). Dataset + participant identities are unique across sources. Subjects need at least three usable pairs; processing failures that leave an evaluation subject absent from training cause the run to fail. `--split_seed` fixes the splits independently of training seeds. This runner does not expose an unseen-subject/LOSO option.
 
-The EEG input projection is the fixed adapter placement. Shared EEG weights and subject-specific low-rank factors are trained jointly. `--alpha_ratios` specifies alpha/r, so rank 8 and ratio 3 mean alpha 24. The default grid has 16 adapter configurations and three seeds: 48 adapter fits plus three baseline fits, 51 fits total. Use a smaller grid for a pilot:
+Shared EEG weights and subject-specific low-rank factors are trained jointly. The search covers three nested placements:
+
+| Placement | Adapted EEG projections |
+|---|---|
+| `input_only` | Input projection only |
+| `eeg_backbone` | Input/output projections, main transformer attention Q/K/V/output, and both feed-forward projections |
+| `full_eeg` | Everything in `eeg_backbone`, plus CLS aggregation attention Q/K/V/output and both feed-forward projections |
+
+For the default one-layer backbone and one-layer CLS aggregator, these adapt 1, 8, and 14 linear projections. BERT is never subject-adapted. Broader placements use an explicit attention/transformer forward path so PyTorch fast paths cannot bypass adapters. The full three-placement comparison requires transformer EEG encoding and CLS pooling. To use other pooling methods, explicitly request `--placements input_only eeg_backbone`; non-transformer EEG architectures support `input_only` only.
+
+`--alpha_ratios` specifies alpha/r, so rank 8 and ratio 3 mean alpha 24. Exactly one matched seed is used (default 1; set `--seed` to change it). The default grid has 3 placements x 4 ranks x 4 ratios = 48 adapter fits plus one independently trained baseline, 49 fits total. Use a smaller grid for a pilot:
 
 ```bash
 python Audio_BPR/subject_adapter_experiment.py \
   --audio_path /path/to/alice_ict_pairs.npy \
   --visual_path /path/to/nieuwland_ict_pairs.npy \
   --output_dir results/combined_pilot \
-  --ranks 4 8 --alpha_ratios 1 3 --seeds 1 \
+  --ranks 4 8 --alpha_ratios 1 3 --seed 1 \
   --epochs 5 --warmup_epochs 1
 ```
 
-Each trial retains its best combined validation-MRR checkpoint, using 90% masking by default (`--primary_masking_level`). The adapter configuration with the highest mean validation MRR across seeds is selected. Only then are the baseline and selected adapter tested. Test queries search the entire deduplicated combined test-passage index, not sampled negatives or separate source pools. Source breakdowns use that same combined index.
+Each trial retains its best combined validation-MRR checkpoint, using 90% masking by default (`--primary_masking_level`). The best rank/scaling configuration is selected separately within each placement, and the overall preferred placement is selected by validation MRR as well. Only then are the baseline and three selected adapter versions tested. Test queries search the entire deduplicated combined test-passage index, not sampled negatives or separate source pools. Source breakdowns use that same combined index.
 
-Test outputs include MRR, Hit@1, Hit@5, Hit@10, and Hit@20 at masking levels 0/25/50/75/90/100, plus mean across levels and matched-seed differences. Use `--hit_k 1 3 5 10 20` to request other hit cutoffs. Masking levels are probabilities of removing the whole ICT query span, not percentages of individual passage tokens removed. Identical passage text is indexed once and shared as a positive by its corresponding queries.
+Test outputs include MRR, Hit@1, Hit@5, Hit@10, and Hit@20 at masking levels 0/25/50/75/90/100, plus mean across levels and per-placement differences against the matched baseline. Parameter counts, adapted layer names, fit times (training plus validation), and test times are recorded. A single seed gives zero across-seed standard deviation; this is not an uncertainty estimate. Use `--hit_k 1 3 5 10 20` to request other hit cutoffs. Masking levels are probabilities of removing the whole ICT query span, not percentages of individual passage tokens removed. Identical passage text is indexed once and shared as a positive by its corresponding queries.
 
 Each new output directory contains:
 
 | Artifact | Purpose |
 |---|---|
 | `experiment_config.json` | Complete command settings |
+| `experiment_matrix.json` | Complete placement/rank/scaling grid and expected number of fits |
 | `split_manifest.json` | Original combined-data row identities in each split |
 | `subject_mapping.json` | Persisted dataset/participant-to-adapter routing |
 | `experiment_log.jsonl` | Append-only lifecycle, epoch, selection, test, and failure events |
-| `search_results.json` | Best validation MRR and parameter counts for every configuration/seed |
-| `selected_adapter.json` | Selected rank/scaling and validation-only selection rule |
+| `search_results.json` | Best validation MRR, parameter counts, and fit time for every configuration |
+| `selected_adapter.json` | Best configuration per placement, overall validation-selected winner, and selection rule |
 | `<trial>/seed_<seed>/best_model.pt` | Best checkpoint, model settings, routing, dimensions, and validation ranks |
 | `<trial>/seed_<seed>/test_metrics.json` | Overall/source metrics, query ranks, and combined-index fingerprints for tested models |
-| `comparison.json` | Baseline/SuLoRA means, standard deviations, and paired differences |
+| `comparison.json` | Baseline and each selected placement's metrics, paired differences, and resource costs |
 
-Existing output directories must be empty; previous results are never overwritten. Failed runs retain their logs and completed artifacts, but automatic resume is not implemented. Full checkpoints include frozen text weights, so budget disk space for all 51 default fits. Pooling and EEG architecture can be changed with `--pooling_strategy` and `--eeg_arch`, but must remain fixed within a comparison.
+Existing output directories must be empty; previous results are never overwritten. Failed runs retain their logs and completed artifacts, but automatic resume is not implemented. Full checkpoints include frozen text weights, so budget disk space for all 49 default fits. Pooling and EEG architecture can be changed with `--pooling_strategy` and `--eeg_arch`, subject to the placement restrictions above, but must remain fixed within a comparison. Earlier input-only checkpoints have a different schema from the new broader placements; do not mix old results into a new search.
+
+### Sequential Slurm Search
+
+The scheduler's explicit subject-adapter mode generates one job script that runs the complete search sequentially. Preparation never calls `sbatch`. The legacy `--use-lora` flag controls text LoRA and is not the subject-adapter search.
+
+```bash
+python Audio_BPR/experiment_scheduler.py \
+  --subject-adapter-search \
+  --audio-data /path/to/alice_ict_pairs.npy \
+  --visual-data /path/to/nieuwland_ict_pairs.npy \
+  --output-dir prepared_experiments_subject_adapters \
+  --seed 1 \
+  --placements input_only eeg_backbone full_eeg \
+  --ranks 4 8 16 32 --alpha-ratios 0.25 1 2 3
+```
+
+This legacy mode writes one sequential `jobs/subject_adapter_search.sbatch` script and never submits it. The prepared script uses equal-probability source sampling; add `--balance_sources` to direct runner commands to use the same policy.
+
+### Independent Slurm Array
+
+For cluster sweeps, submit one independently retryable task per configuration and a dependent finalizer. Each task writes its checkpoint and validation result under its own trial directory. The finalizer only runs after every array task succeeds, selects the best configuration in each placement from validation MRR, then evaluates the baseline and three selected models.
+
+```bash
+python Audio_BPR/experiment_scheduler.py \
+  --subject-adapter-array \
+  --audio-data /path/to/alice_ict_pairs.npy \
+  --visual-data /path/to/nieuwland_ict_pairs.npy \
+  --output-dir prepared_experiments_subject_adapter_array \
+  --time 2-00:01:00 --memory 128G --cpus 8 --gpu-request gpu:1 \
+  --array-concurrency 2 \
+  --seed 1 --placements input_only eeg_backbone full_eeg \
+  --ranks 4 8 16 32 --alpha-ratios 0.25 1 2 3
+```
+
+This mode submits the 49-task array and its `afterok` finalizer. Set `--array-concurrency` to fit the cluster/user GPU and CPU limits. A task interrupted before completing writes no `validation_result.json`; after fixing the cause, requeue that array index. Completed trials are reused on retries. Each array task still has the requested per-job walltime cap.
 
 Project-log wording and limitations are in [PROJECT_DESCRIPTION.md](PROJECT_DESCRIPTION.md); implementation/experiment status is in [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md).
 

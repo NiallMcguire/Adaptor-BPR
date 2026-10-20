@@ -12,6 +12,8 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model, TaskType
 import math
 
+SUBJECT_ADAPTER_PLACEMENTS = ('input_only', 'eeg_backbone', 'full_eeg')
+
 
 class SubjectLowRankLinear(nn.Module):
     """Jointly trained shared projection and identity-routed low-rank updates."""
@@ -23,8 +25,8 @@ class SubjectLowRankLinear(nn.Module):
         self.shared = linear
         self.rank = rank
         self.alpha = alpha
-        self.adapter_a = nn.Parameter(torch.empty(num_subjects, linear.in_features, rank))
-        self.adapter_b = nn.Parameter(torch.empty(num_subjects, rank, linear.out_features))
+        self.adapter_a = nn.Parameter(linear.weight.new_empty(num_subjects, linear.in_features, rank))
+        self.adapter_b = nn.Parameter(linear.weight.new_empty(num_subjects, rank, linear.out_features))
         nn.init.normal_(self.adapter_a, std=math.sqrt(2.0 / rank))
         nn.init.normal_(self.adapter_b, std=0.01)
 
@@ -39,6 +41,79 @@ class SubjectLowRankLinear(nn.Module):
         adapter_b = self.adapter_b[subject_ids]
         correction = torch.bmm(torch.bmm(inputs, adapter_a), adapter_b)
         return self.shared(inputs) + (self.alpha / self.rank) * correction
+
+
+class SubjectSelfAttention(nn.Module):
+    """Explicit Q/K/V and output projections for subject-conditioned attention."""
+
+    def __init__(self, attention, num_subjects, rank, alpha):
+        super().__init__()
+        self.num_heads = attention.num_heads
+        self.hidden_dim = attention.embed_dim
+        self.dropout = attention.dropout
+        for index, name in enumerate(('query', 'key', 'value')):
+            linear = nn.Linear(self.hidden_dim, self.hidden_dim,
+                               bias=attention.in_proj_bias is not None,
+                               device=attention.in_proj_weight.device, dtype=attention.in_proj_weight.dtype)
+            start = index * self.hidden_dim
+            with torch.no_grad():
+                linear.weight.copy_(attention.in_proj_weight[start:start + self.hidden_dim])
+                if linear.bias is not None:
+                    linear.bias.copy_(attention.in_proj_bias[start:start + self.hidden_dim])
+            setattr(self, name, SubjectLowRankLinear(linear, num_subjects, rank, alpha))
+        self.output = SubjectLowRankLinear(attention.out_proj, num_subjects, rank, alpha)
+
+    def forward(self, inputs, padding_mask, subject_ids):
+        batch_size, sequence_length, _ = inputs.shape
+        head_dim = self.hidden_dim // self.num_heads
+        projections = [projection(inputs, subject_ids).reshape(
+            batch_size, sequence_length, self.num_heads, head_dim).transpose(1, 2)
+            for projection in (self.query, self.key, self.value)]
+        attention_mask = None if padding_mask is None else ~padding_mask[:, None, None, :].bool()
+        attended = F.scaled_dot_product_attention(
+            *projections, attn_mask=attention_mask, dropout_p=self.dropout if self.training else 0.0)
+        attended = attended.transpose(1, 2).reshape(batch_size, sequence_length, self.hidden_dim)
+        return self.output(attended, subject_ids)
+
+
+class SubjectTransformerLayer(nn.Module):
+    """Preserve residual/norm/dropout behavior without bypassing adapter forwards."""
+
+    def __init__(self, layer, num_subjects, rank, alpha):
+        super().__init__()
+        layer.self_attn = SubjectSelfAttention(layer.self_attn, num_subjects, rank, alpha)
+        layer.linear1 = SubjectLowRankLinear(layer.linear1, num_subjects, rank, alpha)
+        layer.linear2 = SubjectLowRankLinear(layer.linear2, num_subjects, rank, alpha)
+        self.shared = layer
+
+    def attention_block(self, inputs, padding_mask, subject_ids):
+        return self.shared.dropout1(self.shared.self_attn(inputs, padding_mask, subject_ids))
+
+    def feedforward_block(self, inputs, subject_ids):
+        hidden = self.shared.dropout(self.shared.activation(self.shared.linear1(inputs, subject_ids)))
+        return self.shared.dropout2(self.shared.linear2(hidden, subject_ids))
+
+    def forward(self, inputs, padding_mask, subject_ids):
+        if self.shared.norm_first:
+            inputs = inputs + self.attention_block(self.shared.norm1(inputs), padding_mask, subject_ids)
+            return inputs + self.feedforward_block(self.shared.norm2(inputs), subject_ids)
+        inputs = self.shared.norm1(inputs + self.attention_block(inputs, padding_mask, subject_ids))
+        return self.shared.norm2(inputs + self.feedforward_block(inputs, subject_ids))
+
+
+class SubjectTransformerEncoder(nn.Module):
+    """Route subject identity through every adapted transformer layer."""
+
+    def __init__(self, encoder, num_subjects, rank, alpha):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            SubjectTransformerLayer(layer, num_subjects, rank, alpha) for layer in encoder.layers])
+        self.norm = encoder.norm
+
+    def forward(self, inputs, src_key_padding_mask=None, subject_ids=None):
+        for layer in self.layers:
+            inputs = layer(inputs, src_key_padding_mask, subject_ids)
+        return self.norm(inputs) if self.norm is not None else inputs
 
 
 class SimpleTextEncoder(nn.Module):
@@ -342,17 +417,34 @@ class SimplifiedBrainRetrieval(nn.Module):
             cls_vectors = projected[:, 0:1, :]  # [batch, 1, hidden_dim]
             return cls_vectors
 
-    def enable_subject_adapters(self, num_subjects, rank=8, alpha=8.0):
-        """Adapt the EEG input projection, leaving all shared EEG weights trainable."""
+    def enable_subject_adapters(self, num_subjects, rank=8, alpha=8.0, placement='input_only'):
+        """Apply one of three nested EEG-only adapter placements."""
         if self.query_type != 'eeg' or self.eeg_encoder is None:
             raise ValueError("Subject adapters require an initialized EEG encoder")
+        if placement not in SUBJECT_ADAPTER_PLACEMENTS:
+            raise ValueError(f"Unknown adapter placement: {placement}")
+        if getattr(self, 'subject_adapters_enabled', False):
+            raise ValueError("Subject adapters are already enabled")
+        if placement != 'input_only' and self.eeg_arch != 'transformer':
+            raise ValueError("Backbone/full EEG placements require the transformer EEG encoder")
+        if placement == 'full_eeg' and self.pooling_strategy != 'cls':
+            raise ValueError("Full EEG placement requires CLS pooling to adapt its aggregation transformer")
         if self.eeg_arch == 'transformer':
             linear = self.eeg_encoder.input_projection
             self.eeg_encoder.input_projection = SubjectLowRankLinear(linear, num_subjects, rank, alpha)
+            if placement != 'input_only':
+                self.eeg_encoder.transformer = SubjectTransformerEncoder(
+                    self.eeg_encoder.transformer, num_subjects, rank, alpha)
+                self.eeg_encoder.output_projection = SubjectLowRankLinear(
+                    self.eeg_encoder.output_projection, num_subjects, rank, alpha)
+            if placement == 'full_eeg':
+                self.eeg_cls_transformer = SubjectTransformerEncoder(
+                    self.eeg_cls_transformer, num_subjects, rank, alpha)
         else:
             linear = self.eeg_encoder[0]
             self.eeg_encoder[0] = SubjectLowRankLinear(linear, num_subjects, rank, alpha)
         self.subject_adapters_enabled = True
+        self.subject_adapter_placement = placement
 
     def encode_eeg(self, eeg_input, eeg_mv_mask, subject_ids=None):
         """Encode EEG with CLS or Multi-Vector pooling"""
@@ -455,10 +547,12 @@ class SimplifiedBrainRetrieval(nn.Module):
             full_mask = torch.cat([cls_mask, eeg_padding_mask], dim=1)  # [batch, 1+num_words]
 
             # Apply CLS transformer
-            attended_sequence = self.eeg_cls_transformer(
-                cls_word_sequence,
-                src_key_padding_mask=full_mask  # True = masked
-            )
+            if isinstance(self.eeg_cls_transformer, SubjectTransformerEncoder):
+                attended_sequence = self.eeg_cls_transformer(
+                    cls_word_sequence, src_key_padding_mask=full_mask, subject_ids=subject_ids)
+            else:
+                attended_sequence = self.eeg_cls_transformer(
+                    cls_word_sequence, src_key_padding_mask=full_mask)
 
             # Extract CLS token representation
             pooled_vectors = attended_sequence[:, 0:1, :]  # [batch, 1, hidden_dim]
@@ -571,10 +665,16 @@ class EEGTransformerEncoder(nn.Module):
             padding_mask = (x.abs().sum(dim=-1) == 0)
 
         # Apply transformer with proper masking
-        x = self.transformer(x, src_key_padding_mask=padding_mask)
+        if isinstance(self.transformer, SubjectTransformerEncoder):
+            x = self.transformer(x, src_key_padding_mask=padding_mask, subject_ids=subject_ids)
+        else:
+            x = self.transformer(x, src_key_padding_mask=padding_mask)
 
         # Final projection and normalization
-        x = self.output_projection(x)
+        if isinstance(self.output_projection, SubjectLowRankLinear):
+            x = self.output_projection(x, subject_ids)
+        else:
+            x = self.output_projection(x)
         x = self.layer_norm(x)
         x = self.dropout(x)
 

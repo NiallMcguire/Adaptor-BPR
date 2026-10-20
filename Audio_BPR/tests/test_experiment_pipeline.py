@@ -1,5 +1,7 @@
 import csv
+import copy
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,7 +24,8 @@ from mv_models import create_model
 from mv_models import SubjectLowRankLinear
 from mv_training import (compute_contrastive_loss, test_model, subject_key,
                          evaluate_unified_index, compute_ranking_metrics)
-from experiment_scheduler import EXPERIMENTS, prepare_jobs
+from experiment_scheduler import (EXPERIMENTS, prepare_jobs, prepare_subject_adapter_job,
+                                  prepare_subject_adapter_array, submit_subject_adapter_array)
 from subject_adapter_experiment import parse_args, run_experiment, select_adapter, search_trials
 
 
@@ -115,6 +118,105 @@ def make_trial_row(participant, session, question_id):
 
 
 class ExperimentPipelineSmokeTests(unittest.TestCase):
+    def test_three_adapter_placements_preserve_shared_model_and_train_all_updates(self):
+        inputs = torch.randn(2, 4, 8, 2)
+        inputs[:, -1] = 0
+        masks = torch.ones(2, 4)
+        ids = torch.tensor([0, 1])
+        counts = []
+        for placement, expected_layers in (('input_only', 1), ('eeg_backbone', 8), ('full_eeg', 14)):
+            baseline = create_model(hidden_dim=8, eeg_arch='transformer', device='cpu', use_lora=False,
+                                    pooling_strategy='cls', global_eeg_dims=(4, 8, 2), use_pretrained_text=False)
+            adapted = copy.deepcopy(baseline)
+            adapted.enable_subject_adapters(3, 2, 4, placement)
+            modules = [module for module in adapted.modules() if isinstance(module, SubjectLowRankLinear)]
+            self.assertEqual(len(modules), expected_layers)
+            self.assertFalse(any(isinstance(module, SubjectLowRankLinear) for module in adapted.text_encoder.modules()))
+            counts.append(sum(module.adapter_a.numel() + module.adapter_b.numel() for module in modules))
+            updates = [module.adapter_b.detach().clone() for module in modules]
+            with torch.no_grad():
+                for module in modules:
+                    module.adapter_b.zero_()
+                baseline.eval()
+                adapted.eval()
+                torch.testing.assert_close(adapted.encode_eeg(inputs, masks, ids),
+                                           baseline.encode_eeg(inputs, masks), atol=1e-5, rtol=1e-4)
+                for module, update in zip(modules, updates):
+                    module.adapter_b.copy_(update)
+                encoded = adapted.encode_eeg(inputs, masks, ids)
+                changed = adapted.encode_eeg(inputs, masks, ids.flip(0))
+                self.assertFalse(torch.allclose(encoded, changed))
+            adapted.train()
+            adapted.encode_eeg(inputs, masks, ids).square().sum().backward()
+            for module in modules:
+                self.assertGreater(module.adapter_a.grad[:2].abs().sum().item(), 0)
+                self.assertGreater(module.adapter_b.grad[:2].abs().sum().item(), 0)
+                self.assertEqual(module.adapter_a.grad[2].abs().sum().item(), 0)
+                self.assertGreater(module.shared.weight.grad.abs().sum().item(), 0)
+        self.assertLess(counts[0], counts[1])
+        self.assertLess(counts[1], counts[2])
+
+    def test_search_defaults_cover_three_placements_with_exactly_one_seed(self):
+        argv = ['--audio_path', 'alice.npy', '--visual_path', 'nieuwland.npy', '--output_dir', 'unused']
+        args = parse_args(argv)
+        self.assertEqual(args.seeds, [1])
+        self.assertEqual(args.placements, ['input_only', 'eeg_backbone', 'full_eeg'])
+        trials = search_trials(args.ranks, args.alpha_ratios, args.placements)
+        self.assertEqual(len(trials), 49)
+        self.assertEqual(len({trial['name'] for trial in trials}), 49)
+        for placement in args.placements:
+            candidates = [trial for trial in trials if trial.get('placement') == placement]
+            self.assertEqual(len(candidates), 16)
+            self.assertEqual({(trial['rank'], trial['alpha_over_rank']) for trial in candidates},
+                             {(rank, ratio) for rank in args.ranks for ratio in args.alpha_ratios})
+        with patch('sys.stderr'):
+            with self.assertRaises(SystemExit):
+                parse_args(argv + ['--seeds', '1', '2'])
+            with self.assertRaises(SystemExit):
+                parse_args(argv + ['--pooling_strategy', 'mean'])
+
+    def test_subject_search_scheduler_prepares_all_configs_without_submission(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with patch('subprocess.run') as submit:
+                report = prepare_subject_adapter_job(root / 'alice.npy', root / 'nieuwland.npy', root / 'prepared')
+            submit.assert_not_called()
+            self.assertFalse(report['submitted'])
+            self.assertEqual(report['total_fits'], 49)
+            self.assertEqual(report['seed'], 1)
+            script = Path(report['job_script']).read_text()
+            self.assertIn('subject_adapter_experiment.py', script)
+            self.assertIn('--seed 1', script)
+            self.assertIn('--placements input_only eeg_backbone full_eeg', script)
+            self.assertNotIn('controller.py', script)
+            self.assertIn('No jobs were submitted', (root / 'prepared' / 'PREPARED_NOT_SUBMITTED.txt').read_text())
+
+    def test_array_scheduler_submits_throttled_configs_and_dependent_finalizer(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            prepared_dir = root / 'prepared'
+            report = prepare_subject_adapter_array(
+                root / 'alice.npy', root / 'nieuwland.npy', prepared_dir,
+                ranks=(2,), alpha_ratios=(1,), array_concurrency=2,
+            )
+            self.assertEqual(report['total_fits'], 4)
+            array_script = Path(report['array_script']).read_text()
+            finalizer_script = Path(report['finalizer_script']).read_text()
+            self.assertIn('#SBATCH --array=0-3%2', array_script)
+            self.assertIn('--array-task', array_script)
+            self.assertIn('--finalize', finalizer_script)
+            self.assertEqual(report['submitted'], False)
+            with patch('experiment_scheduler.subprocess.run', side_effect=[
+                subprocess.CompletedProcess([], 0, '91001\n', ''),
+                subprocess.CompletedProcess([], 0, '91002\n', ''),
+            ]) as submit:
+                submitted = submit_subject_adapter_array(prepared_dir)
+            self.assertEqual(submitted['array_job_id'], '91001')
+            self.assertEqual(submitted['finalizer_job_id'], '91002')
+            self.assertEqual(submitted['dependency'], 'afterok:91001')
+            self.assertIn('--dependency=afterok:91001', submit.call_args_list[1].args[0])
+            self.assertTrue(json.loads((prepared_dir / 'experiment_matrix.json').read_text())['submitted'])
+
     def test_subject_adapter_routes_and_trains_only_selected_subjects(self):
         layer = SubjectLowRankLinear(torch.nn.Linear(3, 4), 3, rank=2, alpha=4)
         inputs = torch.randn(2, 5, 3)
@@ -197,7 +299,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                                    seen_subjects_only=True)
 
     def test_adapter_search_uses_mean_validation_mrr(self):
-        trials = search_trials([2], [0.25, 1])
+        trials = search_trials([2], [0.25, 1], ['input_only'])
         runs = [{'trial': trials[1]['name'], 'validation_mrr': value} for value in (0.2, 0.8)]
         runs += [{'trial': trials[2]['name'], 'validation_mrr': value} for value in (0.6, 0.6)]
         selected, scores = select_adapter(trials, runs)
@@ -219,7 +321,7 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             args = parse_args([
                 '--audio_path', str(audio), '--visual_path', str(visual), '--output_dir', str(output),
                 '--hidden_dim', '8', '--batch_size', '4', '--epochs', '1', '--warmup_epochs', '0',
-                '--ranks', '2', '--alpha_ratios', '0.25', '1', '--seeds', '1', '2',
+                '--ranks', '2', '--alpha_ratios', '0.25', '1', '--seed', '1',
                 '--test_masking_levels', '0', '100', '--max_eeg_len', '4', '--max_text_len', '24',
                 '--device', 'cpu', '--balance_sources',
             ])
@@ -227,10 +329,18 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
                     patch('mv_models.AutoModel.from_pretrained', side_effect=tiny_bert):
                 comparison = run_experiment(args)
             self.assertEqual(set(comparison['baseline']), {'0', '100', 'mean_across_masking_levels'})
-            self.assertIn('hit_at_20', comparison['sulora']['100'])
-            self.assertEqual(len(json.loads((output / 'search_results.json').read_text())), 6)
-            self.assertEqual(len(list(output.glob('*/seed_*/best_model.pt'))), 6)
+            for placement in args.placements:
+                self.assertIn('hit_at_20', comparison[placement]['100'])
+                self.assertEqual(comparison[placement]['100']['mrr']['std'], 0)
+            self.assertEqual(comparison['num_seeds'], 1)
+            self.assertEqual(set(comparison['paired_sulora_minus_baseline']), set(args.placements))
+            self.assertEqual(len(json.loads((output / 'search_results.json').read_text())), 7)
+            self.assertEqual(len(list(output.glob('*/seed_*/best_model.pt'))), 7)
             self.assertEqual(len(list(output.glob('*/seed_*/test_metrics.json'))), 4)
+            selection = json.loads((output / 'selected_adapter.json').read_text())
+            self.assertEqual(set(selection['selected_by_placement']), set(args.placements))
+            self.assertIn(selection['selected']['placement'], args.placements)
+            self.assertEqual(json.loads((output / 'experiment_matrix.json').read_text())['total_fits'], 7)
             events = [json.loads(line) for line in (output / 'experiment_log.jsonl').read_text().splitlines()]
             selection_index = next(index for index, event in enumerate(events) if event['event'] == 'adapter_selected')
             self.assertTrue(all(index > selection_index for index, event in enumerate(events)
@@ -241,6 +351,46 @@ class ExperimentPipelineSmokeTests(unittest.TestCase):
             self.assertEqual(len(checkpoint['subject_mapping']), 10)
             with self.assertRaisesRegex(ValueError, 'empty output'):
                 run_experiment(args)
+
+    def test_independent_array_trials_finalize_only_after_all_configs_exist(self):
+        from transformers import BertConfig, BertModel
+
+        def tiny_bert(*args, **kwargs):
+            return BertModel(BertConfig(vocab_size=256, hidden_size=8, num_hidden_layers=1,
+                                        num_attention_heads=2, intermediate_size=16))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = write_synthetic_pairs(root / 'alice_ict_pairs.npy', 'alice', 30, True)
+            visual = write_synthetic_pairs(root / 'nieuwland_ict_pairs.npy', 'nieuwland', 30, True)
+            output = root / 'array_results'
+            args = parse_args([
+                '--audio_path', str(audio), '--visual_path', str(visual), '--output_dir', str(output),
+                '--hidden_dim', '8', '--batch_size', '4', '--epochs', '1', '--warmup_epochs', '0',
+                '--ranks', '2', '--alpha_ratios', '1', '--seed', '1',
+                '--max_eeg_len', '4', '--max_text_len', '24', '--device', 'cpu',
+            ])
+            with patch('subject_adapter_experiment.AutoTokenizer.from_pretrained', return_value=TinyTokenizer()), \
+                    patch('mv_models.AutoModel.from_pretrained', side_effect=tiny_bert):
+                for trial_index in range(3):
+                    task_args = copy.copy(args)
+                    task_args.trial_index = trial_index
+                    run_experiment(task_args)
+                with self.assertRaisesRegex(FileNotFoundError, 'did not complete'):
+                    finalize_args = copy.copy(args)
+                    finalize_args.finalize = True
+                    run_experiment(finalize_args)
+                last_task = copy.copy(args)
+                last_task.trial_index = 3
+                run_experiment(last_task)
+                with patch('subject_adapter_experiment.AutoTokenizer.from_pretrained', return_value=TinyTokenizer()), \
+                        patch('mv_models.AutoModel.from_pretrained', side_effect=tiny_bert):
+                    summary = run_experiment(finalize_args)
+            self.assertEqual(summary['num_seeds'], 1)
+            self.assertEqual(set(summary['paired_sulora_minus_baseline']),
+                             {'input_only', 'eeg_backbone', 'full_eeg'})
+            self.assertTrue((output / 'comparison.json').is_file())
+            self.assertEqual(len(list((output / 'trials').glob('*/test_metrics.json'))), 4)
 
     def test_single_source_loader_deserializes_source_once_for_three_splits(self):
         with tempfile.TemporaryDirectory() as temp_dir:
